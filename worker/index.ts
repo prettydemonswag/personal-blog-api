@@ -1,20 +1,54 @@
+
 const encoder = new TextEncoder();
 const TOKEN_LIFETIME_SECONDS = 12 * 60 * 60;
 const MAX_BODY_LENGTH = 100000;
 
+interface BlogEntry {
+  id: number;
+  title: string;
+  body: string;
+  entry_date: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface D1Statement {
+  bind(...values: (string | number | null)[]): D1Statement;
+  all<T = Record<string, unknown>>(): Promise<{ results?: T[] }>;
+  first<T = Record<string, unknown>>(): Promise<T | null>;
+  run(): Promise<{
+    meta: { last_row_id?: number; changes?: number };
+  }>;
+}
+
+interface Env {
+  DB: { prepare(query: string): D1Statement };
+  BLOG_PASSWORD?: string;
+  SESSION_SECRET?: string;
+  ALLOWED_ORIGIN?: string;
+}
+
+type ValidEntry =
+  | { error: string }
+  | { title: string; body: string; entryDate: string };
+
 export default {
-  async fetch(request, env) {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const origin = request.headers.get("Origin");
     const allowedOrigins = (env.ALLOWED_ORIGIN || "")
       .split(",")
-      .map((item) => item.trim())
+      .map((item: string) => item.trim())
       .filter(Boolean);
 
     if (origin && !allowedOrigins.includes(origin)) {
-      return json({ error: "This website is not allowed to use the blog API." }, 403);
+      return json(
+        { error: "This website is not allowed to use the blog API." },
+        403
+      );
     }
 
     const cors = corsHeaders(origin, allowedOrigins);
+
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: cors });
     }
@@ -30,165 +64,317 @@ export default {
       if (path === "/api/entries" && request.method === "GET") {
         const result = await env.DB.prepare(
           "SELECT id, title, body, entry_date, created_at, updated_at FROM entries ORDER BY entry_date DESC, id DESC"
-        ).all();
+        ).all<BlogEntry>();
+
         return json({ entries: result.results || [] }, 200, cors);
       }
 
       if (path === "/api/login" && request.method === "POST") {
         const body = await readJson(request);
-        if (!body || typeof body.password !== "string") {
+
+        if (!isRecord(body) || typeof body.password !== "string") {
           return json({ error: "Enter the passcode." }, 400, cors);
         }
+
         if (!env.BLOG_PASSWORD || body.password !== env.BLOG_PASSWORD) {
           return json({ error: "That passcode is incorrect." }, 401, cors);
         }
+
         if (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32) {
-          return json({ error: "The Worker needs a SESSION_SECRET of at least 32 characters." }, 500, cors);
+          return json(
+            { error: "The Worker needs a SESSION_SECRET of at least 32 characters." },
+            500,
+            cors
+          );
         }
+
         const token = await createToken(env.SESSION_SECRET);
         return json({ token }, 200, cors);
       }
 
       if (path === "/api/entries" && request.method === "POST") {
-        if (!(await authorized(request, env))) return json({ error: "Your editor session expired. Unlock the editor again." }, 401, cors);
-        const body = await readJson(request);
-        const validated = validateEntry(body);
-        if (validated.error) return json({ error: validated.error }, 400, cors);
+        if (!(await authorized(request, env))) {
+          return json(
+            { error: "Your editor session expired. Unlock the editor again." },
+            401,
+            cors
+          );
+        }
+
+        const validated = validateEntry(await readJson(request));
+        if ("error" in validated) {
+          return json({ error: validated.error }, 400, cors);
+        }
 
         const now = new Date().toISOString();
         const result = await env.DB.prepare(
           "INSERT INTO entries (title, body, entry_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
-        ).bind(validated.title, validated.body, validated.entryDate, now, now).run();
+        )
+          .bind(validated.title, validated.body, validated.entryDate, now, now)
+          .run();
+
+        const insertedId = result.meta.last_row_id;
+        if (typeof insertedId !== "number") {
+          throw new Error("The database did not return the new entry ID.");
+        }
 
         const entry = await env.DB.prepare(
           "SELECT id, title, body, entry_date, created_at, updated_at FROM entries WHERE id = ?"
-        ).bind(result.meta.last_row_id).first();
+        )
+          .bind(insertedId)
+          .first<BlogEntry>();
+
         return json({ entry }, 201, cors);
       }
 
       const match = path.match(/^\/api\/entries\/(\d+)$/);
-      if (match && request.method === "PUT") {
-        if (!(await authorized(request, env))) return json({ error: "Your editor session expired. Unlock the editor again." }, 401, cors);
-        const body = await readJson(request);
-        const validated = validateEntry(body);
-        if (validated.error) return json({ error: validated.error }, 400, cors);
 
+      if (match && request.method === "PUT") {
+        if (!(await authorized(request, env))) {
+          return json(
+            { error: "Your editor session expired. Unlock the editor again." },
+            401,
+            cors
+          );
+        }
+
+        const validated = validateEntry(await readJson(request));
+        if ("error" in validated) {
+          return json({ error: validated.error }, 400, cors);
+        }
+
+        const id = Number(match[1]);
         const now = new Date().toISOString();
+
         const result = await env.DB.prepare(
           "UPDATE entries SET title = ?, body = ?, entry_date = ?, updated_at = ? WHERE id = ?"
-        ).bind(validated.title, validated.body, validated.entryDate, now, Number(match[1])).run();
+        )
+          .bind(validated.title, validated.body, validated.entryDate, now, id)
+          .run();
 
-        if (!result.meta.changes) return json({ error: "Entry not found." }, 404, cors);
+        if (!result.meta.changes) {
+          return json({ error: "Entry not found." }, 404, cors);
+        }
+
         const entry = await env.DB.prepare(
           "SELECT id, title, body, entry_date, created_at, updated_at FROM entries WHERE id = ?"
-        ).bind(Number(match[1])).first();
+        )
+          .bind(id)
+          .first<BlogEntry>();
+
         return json({ entry }, 200, cors);
       }
 
       if (match && request.method === "DELETE") {
-        if (!(await authorized(request, env))) return json({ error: "Your editor session expired. Unlock the editor again." }, 401, cors);
-        const result = await env.DB.prepare("DELETE FROM entries WHERE id = ?")
-          .bind(Number(match[1])).run();
-        if (!result.meta.changes) return json({ error: "Entry not found." }, 404, cors);
+        if (!(await authorized(request, env))) {
+          return json(
+            { error: "Your editor session expired. Unlock the editor again." },
+            401,
+            cors
+          );
+        }
+
+        const result = await env.DB.prepare(
+          "DELETE FROM entries WHERE id = ?"
+        )
+          .bind(Number(match[1]))
+          .run();
+
+        if (!result.meta.changes) {
+          return json({ error: "Entry not found." }, 404, cors);
+        }
+
         return json({ ok: true }, 200, cors);
       }
 
       return json({ error: "Not found." }, 404, cors);
-    } catch (error) {
-      return json({ error: error instanceof Error ? error.message : "Unexpected server error." }, 500, cors);
+    } catch (error: unknown) {
+      return json(
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unexpected server error."
+        },
+        500,
+        cors
+      );
     }
   }
 };
 
-function corsHeaders(origin, allowedOrigins) {
-  const headers = {
+function corsHeaders(
+  origin: string | null,
+  allowedOrigins: string[]
+): Record<string, string> {
+  const headers: Record<string, string> = {
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
-    "Vary": "Origin"
+    Vary: "Origin"
   };
-  if (origin && allowedOrigins.includes(origin)) headers["Access-Control-Allow-Origin"] = origin;
+
+  if (origin && allowedOrigins.includes(origin)) {
+    headers["Access-Control-Allow-Origin"] = origin;
+  }
+
   return headers;
 }
 
-function json(data, status = 200, extraHeaders = {}) {
+function json(
+  data: unknown,
+  status = 200,
+  extraHeaders: Record<string, string> = {}
+): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...extraHeaders }
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...extraHeaders
+    }
   });
 }
 
-async function readJson(request) {
+async function readJson(request: Request): Promise<unknown> {
   const text = await request.text();
-  if (text.length > MAX_BODY_LENGTH + 10000) throw new Error("Request is too large.");
-  try { return JSON.parse(text); }
-  catch (_) { return null; }
+
+  if (text.length > MAX_BODY_LENGTH + 10000) {
+    throw new Error("Request is too large.");
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
 }
 
-function validateEntry(body) {
-  if (!body || typeof body !== "object") return { error: "Entry data is missing or invalid." };
-  const title = typeof body.title === "string" ? body.title.trim() : "";
-  const text = typeof body.body === "string" ? body.body : "";
-  const entryDate = typeof body.entryDate === "string" ? body.entryDate.trim() : "";
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
-  if (!text.trim()) return { error: "An entry cannot be empty." };
-  if (text.length > MAX_BODY_LENGTH) return { error: "Entries must be 100,000 characters or fewer." };
-  if (title.length > 200) return { error: "Titles must be 200 characters or fewer." };
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(entryDate) || Number.isNaN(Date.parse(entryDate))) {
+function validateEntry(value: unknown): ValidEntry {
+  if (!isRecord(value)) {
+    return { error: "Entry data is missing or invalid." };
+  }
+
+  const title = typeof value.title === "string" ? value.title.trim() : "";
+  const text = typeof value.body === "string" ? value.body : "";
+  const entryDate =
+    typeof value.entryDate === "string" ? value.entryDate.trim() : "";
+
+  if (!text.trim()) {
+    return { error: "An entry cannot be empty." };
+  }
+
+  if (text.length > MAX_BODY_LENGTH) {
+    return { error: "Entries must be 100,000 characters or fewer." };
+  }
+
+  if (title.length > 200) {
+    return { error: "Titles must be 200 characters or fewer." };
+  }
+
+  if (
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(entryDate) ||
+    Number.isNaN(Date.parse(entryDate))
+  ) {
     return { error: "Choose a valid date and time." };
   }
+
   return { title, body: text, entryDate };
 }
 
-async function createToken(secret) {
+async function createToken(secret: string): Promise<string> {
   const exp = Math.floor(Date.now() / 1000) + TOKEN_LIFETIME_SECONDS;
-  const payload = base64url(encoder.encode(JSON.stringify({ exp })));
+  const payload = base64url(
+    encoder.encode(JSON.stringify({ exp }))
+  );
   const signature = await sign(payload, secret);
+
   return `${payload}.${signature}`;
 }
 
-async function authorized(request, env) {
+async function authorized(request: Request, env: Env): Promise<boolean> {
   const header = request.headers.get("Authorization") || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+
   if (!token || !env.SESSION_SECRET) return false;
 
   const parts = token.split(".");
   if (parts.length !== 2) return false;
+
   const expected = await sign(parts[0], env.SESSION_SECRET);
   if (!constantTimeEqual(parts[1], expected)) return false;
 
   try {
     const payloadText = new TextDecoder().decode(fromBase64url(parts[0]));
-    const payload = JSON.parse(payloadText);
-    return Number.isFinite(payload.exp) && payload.exp > Math.floor(Date.now() / 1000);
-  } catch (_) {
+    const payload: unknown = JSON.parse(payloadText);
+
+    if (!isRecord(payload)) return false;
+
+    return (
+      typeof payload.exp === "number" &&
+      Number.isFinite(payload.exp) &&
+      payload.exp > Math.floor(Date.now() / 1000)
+    );
+  } catch {
     return false;
   }
 }
 
-async function sign(value, secret) {
+async function sign(value: string, secret: string): Promise<string> {
   const key = await crypto.subtle.importKey(
-    "raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
   );
-  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(value));
+
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    encoder.encode(value)
+  );
+
   return base64url(new Uint8Array(signature));
 }
 
-function base64url(bytes) {
+function base64url(bytes: Uint8Array): string {
   let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
 }
 
-function fromBase64url(value) {
-  const base64 = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - value.length % 4) % 4);
+function fromBase64url(value: string): Uint8Array {
+  const base64 =
+    value.replace(/-/g, "+").replace(/_/g, "/") +
+    "=".repeat((4 - (value.length % 4)) % 4);
+
   const binary = atob(base64);
-  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+
+  return Uint8Array.from(binary, (char: string) => char.charCodeAt(0));
 }
 
-function constantTimeEqual(a, b) {
-  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+function constantTimeEqual(a: string, b: string): boolean {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) {
+    return false;
+  }
+
   let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+
   return diff === 0;
 }
